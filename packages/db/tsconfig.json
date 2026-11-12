@@ -1,0 +1,9 @@
+{
+  "extends": "@crm/config/tsconfig/node-lib.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src"]
+}

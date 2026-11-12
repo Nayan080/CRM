@@ -1,0 +1,6 @@
+# Force LF line endings for all text files (team works on Windows + Linux CI)
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary

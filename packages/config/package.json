@@ -1,0 +1,23 @@
+{
+  "name": "@crm/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared TypeScript and ESLint presets",
+  "exports": {
+    "./eslint": "./eslint/base.js",
+    "./tsconfig/base.json": "./tsconfig/base.json",
+    "./tsconfig/node-lib.json": "./tsconfig/node-lib.json",
+    "./tsconfig/nest.json": "./tsconfig/nest.json",
+    "./tsconfig/next.json": "./tsconfig/next.json"
+  },
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "17.14.0",
+    "typescript-eslint": "8.72.2"
+  },
+  "peerDependencies": {
+    "eslint": "10.14.0"
+  }
+}

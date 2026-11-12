@@ -1,0 +1,20 @@
+packages:
+  - apps/*
+  - packages/*
+
+# pnpm 10 blocks dependency install scripts by default (supply-chain safety).
+# Only these packages are allowed to run their build/postinstall scripts.
+onlyBuiltDependencies:
+  - '@prisma/engines'
+  - '@swc/core'
+  - esbuild
+  - prisma
+  - sharp
+  - unrs-resolver
+
+# Explicitly never run these install scripts (e.g. usage telemetry).
+ignoredBuiltDependencies:
+  - '@scarf/scarf'
+
+# `pnpm add` pins exact versions (reproducible installs; upgrades are deliberate).
+saveExact: true

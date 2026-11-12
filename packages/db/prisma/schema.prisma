@@ -1,0 +1,1193 @@
+// Migration CRM — database schema.
+// Stage 2: identity, tenancy, memberships, roles, invitations, sessions, MFA, audit.
+// Stage 3: agency profile, branches, reference options, professionals, credentials, partners.
+//
+// Conventions (docs/ARCHITECTURE.md §13):
+// - Tenant-owned tables carry `tenant_id`, `@@unique([tenantId, id])`, and reference each other with
+//   composite foreign keys (tenant_id, x_id) so the database rejects cross-tenant links.
+// - Tenant-owned tables are protected by PostgreSQL Row-Level Security (see the migration SQL).
+// - Global identity tables (users, sessions, auth tokens) are not tenant-owned.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_DELETION
+}
+
+enum MembershipKind {
+  STAFF
+  EXTERNAL
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+enum PermissionScope {
+  OWN
+  BRANCH
+  TENANT
+}
+
+/// Kinds of tenant-configurable lists (not hardcoded business categories).
+enum ReferenceCategory {
+  PROFESSION_TYPE
+  PARTNER_TYPE
+  LEAD_SOURCE
+  RELATIONSHIP_TYPE
+  PARTICIPANT_ROLE
+  DOCUMENT_CATEGORY
+}
+
+enum LeadStatus {
+  OPEN
+  CONVERTED
+  LOST
+}
+
+enum ClientKind {
+  INDIVIDUAL
+  BUSINESS
+}
+
+enum MatterStatus {
+  OPEN
+  ON_HOLD
+  CLOSED
+  ARCHIVED
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+/// Malware scanning is required before production (decided 2026-11-10); until a scanner is added
+/// every file stays NOT_SCANNED.
+enum ScanStatus {
+  NOT_SCANNED
+  CLEAN
+  INFECTED
+}
+
+enum ConsentMethod {
+  WRITTEN
+  VERBAL
+  ELECTRONIC
+}
+
+enum ActivityType {
+  NOTE
+  CALL
+  EMAIL
+  MEETING
+}
+
+/// Explicit verification state of a credential. "Expired" is derived from the expiry date.
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+// ───────────────────────────── Global identity ─────────────────────────────
+
+/// Global login identity. Access to a tenant comes only from a Membership.
+model User {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  /// Stored lower-cased and trimmed.
+  email             String    @unique
+  name              String
+  passwordHash      String?   @map("password_hash")
+  emailVerifiedAt   DateTime? @map("email_verified_at")
+  /// AES-256-GCM encrypted TOTP secret (pending until mfaEnabledAt is set).
+  mfaSecretEnc      String?   @map("mfa_secret_enc")
+  mfaEnabledAt      DateTime? @map("mfa_enabled_at")
+  /// Last accepted TOTP time-step, to block code replay.
+  mfaLastStep       BigInt?   @map("mfa_last_step")
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  lockedUntil       DateTime? @map("locked_until")
+  passwordChangedAt DateTime? @map("password_changed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  memberships   Membership[]
+  sessions      Session[]
+  authTokens    AuthToken[]
+  recoveryCodes MfaRecoveryCode[]
+  platformRoles PlatformRoleAssignment[]
+
+  @@map("users")
+}
+
+/// One login on one device. Access tokens reference it (sid) so it can be revoked server-side.
+model Session {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  mfaVerified       Boolean   @default(false) @map("mfa_verified")
+  userAgent         String?   @map("user_agent")
+  ipAddress         String?   @map("ip_address")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  lastUsedAt        DateTime  @default(now()) @map("last_used_at")
+  idleExpiresAt     DateTime  @map("idle_expires_at")
+  absoluteExpiresAt DateTime  @map("absolute_expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+  revokedReason     String?   @map("revoked_reason")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// Rotating refresh tokens. Each is single-use; re-use of a used token signals theft.
+model RefreshToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  sessionId String    @map("session_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  createdAt DateTime  @default(now()) @map("created_at")
+  usedAt    DateTime? @map("used_at")
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("refresh_tokens")
+}
+
+/// Single-use email verification / password reset tokens (stored hashed).
+model AuthToken {
+  id        String        @id @default(uuid(7)) @db.Uuid
+  userId    String        @map("user_id") @db.Uuid
+  type      AuthTokenType
+  tokenHash String        @unique @map("token_hash")
+  expiresAt DateTime      @map("expires_at")
+  usedAt    DateTime?     @map("used_at")
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+model MfaRecoveryCode {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  codeHash  String    @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("mfa_recovery_codes")
+}
+
+// ───────────────────────────── Tenancy & access ─────────────────────────────
+
+/// One agency workspace.
+model Tenant {
+  id                   String       @id @default(uuid(7)) @db.Uuid
+  slug                 String       @unique
+  name                 String
+  status               TenantStatus @default(ACTIVE)
+  /// ISO 3166-1 alpha-2. Launch market: AU (DEC-01).
+  country              String       @default("AU")
+  /// IANA time zone.
+  timezone             String       @default("Australia/Sydney")
+  legalName            String?      @map("legal_name")
+  phone                String?
+  contactEmail         String?      @map("contact_email")
+  website              String?
+  addressLine          String?      @map("address_line")
+  city                 String?
+  region               String?
+  postcode             String?
+  /// Version of the system role templates applied (see ROLE_TEMPLATES_VERSION in @crm/permissions).
+  rolesVersion         Int          @default(1) @map("roles_version")
+  /// Plan and usage limits, assigned manually by a platform admin (no payments, DEC-16).
+  planId               String?      @map("plan_id") @db.Uuid
+  /// Why the status was last changed (suspension / offboarding). Set by platform admins.
+  statusReason         String?      @map("status_reason")
+  statusChangedAt      DateTime?    @map("status_changed_at")
+  /// Automation (Stage 8, off by default): email assigned staff this many days before each
+  /// deadline, e.g. {7,1}. Kept on the agency row so the scheduler can find agencies that use it.
+  deadlineReminderDays Int[]        @default([]) @map("deadline_reminder_days")
+  /// Automation: remind the lead owner after this many days without activity. null = off.
+  leadFollowUpDays     Int?         @map("lead_follow_up_days")
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  roles                Role[]
+  memberships          Membership[]
+  invitations          Invitation[]
+  auditLogs            AuditLog[]
+  branches             Branch[]
+  referenceOptions     ReferenceOption[]
+  professionals        ProfessionalProfile[]
+  partnerOrganizations PartnerOrganization[]
+  counters             TenantCounter[]
+  leads                Lead[]
+  clients              Client[]
+  activities           Activity[]
+  appointments         Appointment[]
+  matterTypes          MatterType[]
+  matters              Matter[]
+  tasks                Task[]
+  documents            Document[]
+  consents             Consent[]
+  shares               ResourceShare[]
+  plan                 Plan?                 @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@map("tenants")
+}
+
+/// Tenant-owned bundle of permissions. System roles are copied from templates on tenant creation.
+model Role {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  key         String
+  name        String
+  isSystem    Boolean  @default(true) @map("is_system")
+  requiresMfa Boolean  @default(false) @map("requires_mfa")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  permissions RolePermission[]
+  memberships Membership[]
+  invitations Invitation[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, key])
+  @@map("roles")
+}
+
+model RolePermission {
+  id         String          @id @default(uuid(7)) @db.Uuid
+  tenantId   String          @map("tenant_id") @db.Uuid
+  roleId     String          @map("role_id") @db.Uuid
+  permission String
+  scope      PermissionScope @default(TENANT)
+
+  role Role @relation(fields: [tenantId, roleId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([roleId, permission])
+  @@index([tenantId])
+  @@map("role_permissions")
+}
+
+/// A user's access to one tenant. EXTERNAL members have no role: access only via explicit shares.
+model Membership {
+  id        String           @id @default(uuid(7)) @db.Uuid
+  tenantId  String           @map("tenant_id") @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  roleId    String?          @map("role_id") @db.Uuid
+  kind      MembershipKind   @default(STAFF)
+  status    MembershipStatus @default(ACTIVE)
+  joinedAt  DateTime         @default(now()) @map("joined_at")
+  removedAt DateTime?        @map("removed_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  tenant             Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user               User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role               Role?                 @relation(fields: [tenantId, roleId], references: [tenantId, id], onDelete: Restrict)
+  branches           MembershipBranch[]
+  ownedLeads         Lead[]                @relation("LeadOwner")
+  hostedAppointments Appointment[]         @relation("AppointmentHost")
+  activities         Activity[]            @relation("ActivityActor")
+  matterAssignments  MatterAssignment[]
+  createdMatters     Matter[]              @relation("MatterCreator")
+  matterHistory      MatterStatusHistory[]
+  assignedTasks      Task[]                @relation("TaskAssignee")
+  createdTasks       Task[]                @relation("TaskCreator")
+  completedChecklist ChecklistItem[]
+  uploadedDocuments  Document[]            @relation("DocumentUploader")
+  uploadedVersions   DocumentVersion[]
+  recordedConsents   Consent[]
+  receivedShares     ResourceShare[]       @relation("ShareGrantee")
+  createdShares      ResourceShare[]       @relation("ShareCreator")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, userId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+model Invitation {
+  id                    String           @id @default(uuid(7)) @db.Uuid
+  tenantId              String           @map("tenant_id") @db.Uuid
+  /// Stored lower-cased and trimmed.
+  email                 String
+  kind                  MembershipKind   @default(STAFF)
+  roleId                String?          @map("role_id") @db.Uuid
+  /// Branches the new STAFF member is assigned to on acceptance.
+  branchIds             String[]         @default([]) @map("branch_ids") @db.Uuid
+  tokenHash             String           @unique @map("token_hash")
+  status                InvitationStatus @default(PENDING)
+  expiresAt             DateTime         @map("expires_at")
+  invitedByMembershipId String           @map("invited_by_membership_id") @db.Uuid
+  acceptedByUserId      String?          @map("accepted_by_user_id") @db.Uuid
+  acceptedAt            DateTime?        @map("accepted_at")
+  revokedAt             DateTime?        @map("revoked_at")
+  createdAt             DateTime         @default(now()) @map("created_at")
+  updatedAt             DateTime         @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  role   Role?  @relation(fields: [tenantId, roleId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, email])
+  @@map("invitations")
+}
+
+/// Append-only security & business audit trail (UPDATE/DELETE blocked by a trigger).
+model AuditLog {
+  id                BigInt   @id @default(autoincrement())
+  /// Null = not tied to one tenant (e.g. login, password reset).
+  tenantId          String?  @map("tenant_id") @db.Uuid
+  actorUserId       String?  @map("actor_user_id") @db.Uuid
+  actorMembershipId String?  @map("actor_membership_id") @db.Uuid
+  action            String
+  targetType        String?  @map("target_type")
+  targetId          String?  @map("target_id")
+  requestId         String?  @map("request_id")
+  ipAddress         String?  @map("ip_address")
+  /// Never store secrets or raw sensitive values here.
+  metadata          Json?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@map("audit_logs")
+}
+
+// ───────────────────────────── Organization & directory (Stage 3) ─────────────────────────────
+
+/// A location or operating unit of an agency.
+model Branch {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String
+  addressLine String?  @map("address_line")
+  city        String?
+  region      String?
+  postcode    String?
+  phone       String?
+  /// IANA time zone; falls back to the tenant's when empty.
+  timezone    String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  members MembershipBranch[]
+  leads   Lead[]
+  clients Client[]
+  matters Matter[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, name])
+  @@map("branches")
+}
+
+/// Which branches a member works in (drives BRANCH-scoped permissions).
+model MembershipBranch {
+  tenantId     String @map("tenant_id") @db.Uuid
+  membershipId String @map("membership_id") @db.Uuid
+  branchId     String @map("branch_id") @db.Uuid
+
+  membership Membership @relation(fields: [tenantId, membershipId], references: [tenantId, id], onDelete: Cascade)
+  branch     Branch     @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Cascade)
+
+  @@id([membershipId, branchId])
+  @@index([tenantId, branchId])
+  @@map("membership_branches")
+}
+
+/// Tenant-configurable list values (profession types, partner types, ...). Seeded with defaults.
+model ReferenceOption {
+  id        String            @id @default(uuid(7)) @db.Uuid
+  tenantId  String            @map("tenant_id") @db.Uuid
+  category  ReferenceCategory
+  key       String
+  name      String
+  sortOrder Int               @default(0) @map("sort_order")
+  isActive  Boolean           @default(true) @map("is_active")
+  createdAt DateTime          @default(now()) @map("created_at")
+  updatedAt DateTime          @updatedAt @map("updated_at")
+
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  professionals        ProfessionalProfile[]
+  partnerOrganizations PartnerOrganization[]
+  leadsWithSource      Lead[]
+  clientRelationships  ClientRelationship[]
+  matterParticipants   MatterParticipant[]
+  documents            Document[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, category, key])
+  @@map("reference_options")
+}
+
+/// Independent external business. Being listed here grants NO access to tenant data.
+model PartnerOrganization {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  tenantId              String    @map("tenant_id") @db.Uuid
+  name                  String
+  typeId                String    @map("type_id") @db.Uuid
+  website               String?
+  email                 String?
+  phone                 String?
+  notes                 String?
+  createdByMembershipId String    @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+  deletedAt             DateTime? @map("deleted_at")
+
+  tenant        Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  type          ReferenceOption       @relation(fields: [tenantId, typeId], references: [tenantId, id], onDelete: Restrict)
+  contacts      PartnerContact[]
+  professionals ProfessionalProfile[]
+  referredLeads Lead[]
+  participantIn MatterParticipant[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, name])
+  @@map("partner_organizations")
+}
+
+model PartnerContact {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  tenantId     String    @map("tenant_id") @db.Uuid
+  partnerOrgId String    @map("partner_org_id") @db.Uuid
+  fullName     String    @map("full_name")
+  email        String?
+  phone        String?
+  position     String?
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  partnerOrg PartnerOrganization @relation(fields: [tenantId, partnerOrgId], references: [tenantId, id], onDelete: Restrict)
+
+  referredLeads Lead[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, partnerOrgId])
+  @@map("partner_contacts")
+}
+
+/// A person's professional details. Directory entry only: it is NOT a login and grants no access.
+model ProfessionalProfile {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  tenantId              String    @map("tenant_id") @db.Uuid
+  fullName              String    @map("full_name")
+  professionTypeId      String    @map("profession_type_id") @db.Uuid
+  email                 String?
+  phone                 String?
+  organizationName      String?   @map("organization_name")
+  partnerOrgId          String?   @map("partner_org_id") @db.Uuid
+  notes                 String?
+  createdByMembershipId String    @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+  deletedAt             DateTime? @map("deleted_at")
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  professionType ReferenceOption      @relation(fields: [tenantId, professionTypeId], references: [tenantId, id], onDelete: Restrict)
+  partnerOrg     PartnerOrganization? @relation(fields: [tenantId, partnerOrgId], references: [tenantId, id], onDelete: Restrict)
+  credentials    Credential[]
+  participantIn  MatterParticipant[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, fullName])
+  @@map("professional_profiles")
+}
+
+/// Licence / registration metadata. Stored as claimed; validity is never assumed.
+model Credential {
+  id                     String             @id @default(uuid(7)) @db.Uuid
+  tenantId               String             @map("tenant_id") @db.Uuid
+  profileId              String             @map("profile_id") @db.Uuid
+  credentialType         String             @map("credential_type")
+  issuer                 String
+  identifier             String
+  issuedOn               DateTime?          @map("issued_on") @db.Date
+  expiresOn              DateTime?          @map("expires_on") @db.Date
+  status                 VerificationStatus @default(UNVERIFIED)
+  verifiedAt             DateTime?          @map("verified_at")
+  verifiedByMembershipId String?            @map("verified_by_membership_id") @db.Uuid
+  verificationNote       String?            @map("verification_note")
+  createdAt              DateTime           @default(now()) @map("created_at")
+  updatedAt              DateTime           @updatedAt @map("updated_at")
+
+  profile ProfessionalProfile @relation(fields: [tenantId, profileId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, profileId])
+  @@map("credentials")
+}
+
+// ───────────────────────────── Stage 4: CRM core ─────────────────────────────
+
+/// Per-tenant sequences for human-friendly numbers (client numbers, matter references).
+model TenantCounter {
+  tenantId String @map("tenant_id") @db.Uuid
+  key      String
+  value    Int    @default(0)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@id([tenantId, key])
+  @@map("tenant_counters")
+}
+
+model Lead {
+  id                    String     @id @default(uuid(7)) @db.Uuid
+  tenantId              String     @map("tenant_id") @db.Uuid
+  branchId              String?    @map("branch_id") @db.Uuid
+  ownerMembershipId     String?    @map("owner_membership_id") @db.Uuid
+  fullName              String     @map("full_name")
+  email                 String?
+  phone                 String?
+  /// Digits only, for duplicate matching.
+  phoneDigits           String?    @map("phone_digits")
+  sourceId              String?    @map("source_id") @db.Uuid
+  referredByPartnerId   String?    @map("referred_by_partner_id") @db.Uuid
+  referredByContactId   String?    @map("referred_by_contact_id") @db.Uuid
+  interest              String?
+  notes                 String?
+  status                LeadStatus @default(OPEN)
+  lostReason            String?    @map("lost_reason")
+  convertedClientId     String?    @map("converted_client_id") @db.Uuid
+  convertedAt           DateTime?  @map("converted_at")
+  /// Last "no activity" reminder sent to the owner (Stage 8 automation).
+  followUpNudgedAt      DateTime?  @map("follow_up_nudged_at")
+  createdByMembershipId String     @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime   @default(now()) @map("created_at")
+  updatedAt             DateTime   @updatedAt @map("updated_at")
+  deletedAt             DateTime?  @map("deleted_at")
+
+  tenant          Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  branch          Branch?              @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
+  owner           Membership?          @relation("LeadOwner", fields: [tenantId, ownerMembershipId], references: [tenantId, id], onDelete: Restrict)
+  source          ReferenceOption?     @relation(fields: [tenantId, sourceId], references: [tenantId, id], onDelete: Restrict)
+  referredBy      PartnerOrganization? @relation(fields: [tenantId, referredByPartnerId], references: [tenantId, id], onDelete: Restrict)
+  referredContact PartnerContact?      @relation(fields: [tenantId, referredByContactId], references: [tenantId, id], onDelete: Restrict)
+  convertedClient Client?              @relation("LeadConversion", fields: [tenantId, convertedClientId], references: [tenantId, id], onDelete: Restrict)
+  activities      Activity[]
+  appointments    Appointment[]
+  tasks           Task[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, ownerMembershipId])
+  @@index([tenantId, email])
+  @@index([tenantId, phoneDigits])
+  @@map("leads")
+}
+
+model Client {
+  id                    String     @id @default(uuid(7)) @db.Uuid
+  tenantId              String     @map("tenant_id") @db.Uuid
+  branchId              String?    @map("branch_id") @db.Uuid
+  clientNumber          String     @map("client_number")
+  kind                  ClientKind
+  /// Full name (individual) or business name (business).
+  displayName           String     @map("display_name")
+  email                 String?
+  phone                 String?
+  phoneDigits           String?    @map("phone_digits")
+  /// Sensitive. Individuals only.
+  dateOfBirth           DateTime?  @map("date_of_birth") @db.Date
+  nationality           String?
+  addressLine           String?    @map("address_line")
+  notes                 String?
+  createdByMembershipId String     @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime   @default(now()) @map("created_at")
+  updatedAt             DateTime   @updatedAt @map("updated_at")
+  deletedAt             DateTime?  @map("deleted_at")
+
+  tenant        Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  branch        Branch?              @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
+  sourceLeads   Lead[]               @relation("LeadConversion")
+  relationsFrom ClientRelationship[] @relation("RelationshipFrom")
+  relationsTo   ClientRelationship[] @relation("RelationshipTo")
+  activities    Activity[]
+  appointments  Appointment[]
+  matters       Matter[]
+  participantIn MatterParticipant[]
+  tasks         Task[]
+  documents     Document[]
+  consents      Consent[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, clientNumber])
+  @@index([tenantId, displayName])
+  @@index([tenantId, email])
+  @@index([tenantId, phoneDigits])
+  @@map("clients")
+}
+
+/// Family members, dependants and business contacts linked between client records.
+model ClientRelationship {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  fromClientId String   @map("from_client_id") @db.Uuid
+  toClientId   String   @map("to_client_id") @db.Uuid
+  typeId       String   @map("type_id") @db.Uuid
+  notes        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  fromClient Client          @relation("RelationshipFrom", fields: [tenantId, fromClientId], references: [tenantId, id], onDelete: Cascade)
+  toClient   Client          @relation("RelationshipTo", fields: [tenantId, toClientId], references: [tenantId, id], onDelete: Cascade)
+  type       ReferenceOption @relation(fields: [tenantId, typeId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@unique([fromClientId, toClientId, typeId])
+  @@map("client_relationships")
+}
+
+/// Timeline entry (call, email, note, meeting) on exactly one lead, client or matter.
+model Activity {
+  id                String       @id @default(uuid(7)) @db.Uuid
+  tenantId          String       @map("tenant_id") @db.Uuid
+  leadId            String?      @map("lead_id") @db.Uuid
+  clientId          String?      @map("client_id") @db.Uuid
+  matterId          String?      @map("matter_id") @db.Uuid
+  type              ActivityType
+  summary           String
+  body              String?
+  occurredAt        DateTime     @map("occurred_at")
+  actorMembershipId String       @map("actor_membership_id") @db.Uuid
+  createdAt         DateTime     @default(now()) @map("created_at")
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  lead   Lead?      @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict)
+  client Client?    @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  matter Matter?    @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Restrict)
+  actor  Membership @relation("ActivityActor", fields: [tenantId, actorMembershipId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, leadId, occurredAt])
+  @@index([tenantId, clientId, occurredAt])
+  @@index([tenantId, matterId, occurredAt])
+  @@map("activities")
+}
+
+/// Consultations and other meetings.
+model Appointment {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  tenantId              String    @map("tenant_id") @db.Uuid
+  title                 String
+  startsAt              DateTime  @map("starts_at")
+  endsAt                DateTime  @map("ends_at")
+  location              String?
+  notes                 String?
+  isConsultation        Boolean   @default(false) @map("is_consultation")
+  hostMembershipId      String    @map("host_membership_id") @db.Uuid
+  leadId                String?   @map("lead_id") @db.Uuid
+  clientId              String?   @map("client_id") @db.Uuid
+  matterId              String?   @map("matter_id") @db.Uuid
+  cancelledAt           DateTime? @map("cancelled_at")
+  createdByMembershipId String    @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  host   Membership @relation("AppointmentHost", fields: [tenantId, hostMembershipId], references: [tenantId, id], onDelete: Restrict)
+  lead   Lead?      @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict)
+  client Client?    @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  matter Matter?    @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, startsAt])
+  @@index([tenantId, hostMembershipId, startsAt])
+  @@map("appointments")
+}
+
+// ───────────────────────────── Matters (Stage 5) ─────────────────────────────
+
+/// Agency-configured matter (service/case) type. Defaults are generic, editable examples (DEC-13).
+model MatterType {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  sortOrder   Int      @default(100) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  stages    MatterStage[]
+  checklist ChecklistTemplateItem[]
+  matters   Matter[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, name])
+  @@map("matter_types")
+}
+
+model MatterStage {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  matterTypeId String   @map("matter_type_id") @db.Uuid
+  name         String
+  sortOrder    Int      @map("sort_order")
+  /// A final stage (e.g. "Decision received"). Does not close the matter by itself.
+  isTerminal   Boolean  @default(false) @map("is_terminal")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  matterType    MatterType          @relation(fields: [tenantId, matterTypeId], references: [tenantId, id], onDelete: Cascade)
+  matters       Matter[]
+  taskTemplates StageTaskTemplate[]
+
+  @@unique([tenantId, id])
+  @@unique([matterTypeId, name])
+  @@index([tenantId, matterTypeId])
+  @@map("matter_stages")
+}
+
+/// Checklist item copied into each new matter of the type.
+model ChecklistTemplateItem {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  matterTypeId String   @map("matter_type_id") @db.Uuid
+  title        String
+  isRequired   Boolean  @default(true) @map("is_required")
+  sortOrder    Int      @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  matterType MatterType @relation(fields: [tenantId, matterTypeId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, matterTypeId])
+  @@map("checklist_template_items")
+}
+
+model Matter {
+  id                    String       @id @default(uuid(7)) @db.Uuid
+  tenantId              String       @map("tenant_id") @db.Uuid
+  branchId              String?      @map("branch_id") @db.Uuid
+  clientId              String       @map("client_id") @db.Uuid
+  matterTypeId          String       @map("matter_type_id") @db.Uuid
+  stageId               String?      @map("stage_id") @db.Uuid
+  /// Unique per agency, e.g. M-000001.
+  reference             String
+  title                 String
+  description           String?
+  status                MatterStatus @default(OPEN)
+  openedAt              DateTime     @default(now()) @map("opened_at")
+  closedAt              DateTime?    @map("closed_at")
+  createdByMembershipId String       @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  tenant       Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  branch       Branch?               @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
+  client       Client                @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  matterType   MatterType            @relation(fields: [tenantId, matterTypeId], references: [tenantId, id], onDelete: Restrict)
+  stage        MatterStage?          @relation(fields: [tenantId, stageId], references: [tenantId, id], onDelete: Restrict)
+  createdBy    Membership            @relation("MatterCreator", fields: [tenantId, createdByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  assignments  MatterAssignment[]
+  participants MatterParticipant[]
+  deadlines    MatterDeadline[]
+  checklist    ChecklistItem[]
+  history      MatterStatusHistory[]
+  tasks        Task[]
+  activities   Activity[]
+  appointments Appointment[]
+  documents    Document[]
+  shares       ResourceShare[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, reference])
+  @@index([tenantId, status, updatedAt])
+  @@index([tenantId, clientId])
+  @@index([tenantId, branchId])
+  @@map("matters")
+}
+
+/// Staff assigned to a matter. Unassigning keeps the row (history) with unassignedAt set.
+model MatterAssignment {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  tenantId       String    @map("tenant_id") @db.Uuid
+  matterId       String    @map("matter_id") @db.Uuid
+  membershipId   String    @map("membership_id") @db.Uuid
+  responsibility String?
+  assignedAt     DateTime  @default(now()) @map("assigned_at")
+  unassignedAt   DateTime? @map("unassigned_at")
+
+  matter     Matter     @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Cascade)
+  membership Membership @relation(fields: [tenantId, membershipId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, membershipId])
+  @@index([matterId])
+  @@map("matter_assignments")
+}
+
+/// A client, directory professional or partner organization involved in a matter (exactly one).
+model MatterParticipant {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  tenantId       String   @map("tenant_id") @db.Uuid
+  matterId       String   @map("matter_id") @db.Uuid
+  roleId         String   @map("role_id") @db.Uuid
+  clientId       String?  @map("client_id") @db.Uuid
+  professionalId String?  @map("professional_id") @db.Uuid
+  partnerOrgId   String?  @map("partner_org_id") @db.Uuid
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  matter       Matter               @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Cascade)
+  role         ReferenceOption      @relation(fields: [tenantId, roleId], references: [tenantId, id], onDelete: Restrict)
+  client       Client?              @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  professional ProfessionalProfile? @relation(fields: [tenantId, professionalId], references: [tenantId, id], onDelete: Restrict)
+  partnerOrg   PartnerOrganization? @relation(fields: [tenantId, partnerOrgId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([matterId])
+  @@map("matter_participants")
+}
+
+model MatterDeadline {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  tenantId       String    @map("tenant_id") @db.Uuid
+  matterId       String    @map("matter_id") @db.Uuid
+  title          String
+  dueAt          DateTime  @map("due_at")
+  /// When to email the assigned staff. Sent once (reminderSentAt).
+  remindAt       DateTime? @map("remind_at")
+  reminderSentAt DateTime? @map("reminder_sent_at")
+  completedAt    DateTime? @map("completed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  matter       Matter                @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Cascade)
+  reminderLogs DeadlineReminderLog[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, dueAt])
+  @@index([remindAt])
+  @@map("matter_deadlines")
+}
+
+model ChecklistItem {
+  id                      String    @id @default(uuid(7)) @db.Uuid
+  tenantId                String    @map("tenant_id") @db.Uuid
+  matterId                String    @map("matter_id") @db.Uuid
+  title                   String
+  isRequired              Boolean   @default(true) @map("is_required")
+  sortOrder               Int       @map("sort_order")
+  completedAt             DateTime? @map("completed_at")
+  completedByMembershipId String?   @map("completed_by_membership_id") @db.Uuid
+  createdAt               DateTime  @default(now()) @map("created_at")
+
+  matter      Matter      @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Cascade)
+  completedBy Membership? @relation(fields: [tenantId, completedByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  documents   Document[]
+
+  @@unique([tenantId, id])
+  @@index([matterId])
+  @@map("checklist_items")
+}
+
+/// Append-only log of status and stage changes.
+model MatterStatusHistory {
+  id                    String        @id @default(uuid(7)) @db.Uuid
+  tenantId              String        @map("tenant_id") @db.Uuid
+  matterId              String        @map("matter_id") @db.Uuid
+  fromStatus            MatterStatus? @map("from_status")
+  toStatus              MatterStatus? @map("to_status")
+  fromStageId           String?       @map("from_stage_id") @db.Uuid
+  toStageId             String?       @map("to_stage_id") @db.Uuid
+  reason                String?
+  changedByMembershipId String        @map("changed_by_membership_id") @db.Uuid
+  createdAt             DateTime      @default(now()) @map("created_at")
+
+  matter    Matter     @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Cascade)
+  changedBy Membership @relation(fields: [tenantId, changedByMembershipId], references: [tenantId, id], onDelete: Restrict)
+
+  @@index([tenantId, matterId, createdAt])
+  @@map("matter_status_history")
+}
+
+/// Work item, optionally linked to one matter, client or lead.
+model Task {
+  id                    String       @id @default(uuid(7)) @db.Uuid
+  tenantId              String       @map("tenant_id") @db.Uuid
+  title                 String
+  description           String?
+  status                TaskStatus   @default(OPEN)
+  priority              TaskPriority @default(MEDIUM)
+  dueAt                 DateTime?    @map("due_at")
+  assigneeMembershipId  String?      @map("assignee_membership_id") @db.Uuid
+  matterId              String?      @map("matter_id") @db.Uuid
+  clientId              String?      @map("client_id") @db.Uuid
+  leadId                String?      @map("lead_id") @db.Uuid
+  /// Set when the task was created automatically from a stage task template.
+  templateId            String?      @map("template_id") @db.Uuid
+  completedAt           DateTime?    @map("completed_at")
+  createdByMembershipId String       @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  assignee  Membership?        @relation("TaskAssignee", fields: [tenantId, assigneeMembershipId], references: [tenantId, id], onDelete: Restrict)
+  createdBy Membership         @relation("TaskCreator", fields: [tenantId, createdByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  matter    Matter?            @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Restrict)
+  client    Client?            @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  lead      Lead?              @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict)
+  template  StageTaskTemplate? @relation(fields: [tenantId, templateId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, assigneeMembershipId, status])
+  @@index([tenantId, matterId])
+  @@index([tenantId, dueAt])
+  @@map("tasks")
+}
+
+// ───────────────────────────── Documents & sharing (Stage 6) ─────────────────────────────
+
+/// A client's document, optionally filed on one of the client's matters. Files live in private
+/// object storage; the database holds metadata only. Deleting is a soft delete.
+model Document {
+  id                     String    @id @default(uuid(7)) @db.Uuid
+  tenantId               String    @map("tenant_id") @db.Uuid
+  clientId               String    @map("client_id") @db.Uuid
+  matterId               String?   @map("matter_id") @db.Uuid
+  checklistItemId        String?   @map("checklist_item_id") @db.Uuid
+  categoryId             String?   @map("category_id") @db.Uuid
+  title                  String
+  uploadedByMembershipId String    @map("uploaded_by_membership_id") @db.Uuid
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+  deletedAt              DateTime? @map("deleted_at")
+
+  tenant        Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  client        Client            @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  matter        Matter?           @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Restrict)
+  checklistItem ChecklistItem?    @relation(fields: [tenantId, checklistItemId], references: [tenantId, id], onDelete: Restrict)
+  category      ReferenceOption?  @relation(fields: [tenantId, categoryId], references: [tenantId, id], onDelete: Restrict)
+  uploadedBy    Membership        @relation("DocumentUploader", fields: [tenantId, uploadedByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  versions      DocumentVersion[]
+  sharedIn      ShareDocument[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, clientId])
+  @@index([tenantId, matterId])
+  @@map("documents")
+}
+
+/// One uploaded file. New uploads add a version; versions are never overwritten.
+model DocumentVersion {
+  id                     String     @id @default(uuid(7)) @db.Uuid
+  tenantId               String     @map("tenant_id") @db.Uuid
+  documentId             String     @map("document_id") @db.Uuid
+  versionNumber          Int        @map("version_number")
+  /// Object key in storage. Never contains the file name.
+  storageKey             String     @unique @map("storage_key")
+  fileName               String     @map("file_name")
+  /// Detected from the file's content, not from the browser.
+  mimeType               String     @map("mime_type")
+  sizeBytes              Int        @map("size_bytes")
+  sha256                 String
+  scanStatus             ScanStatus @default(NOT_SCANNED) @map("scan_status")
+  uploadedByMembershipId String     @map("uploaded_by_membership_id") @db.Uuid
+  createdAt              DateTime   @default(now()) @map("created_at")
+
+  document   Document   @relation(fields: [tenantId, documentId], references: [tenantId, id], onDelete: Restrict)
+  uploadedBy Membership @relation(fields: [tenantId, uploadedByMembershipId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@unique([documentId, versionNumber])
+  @@map("document_versions")
+}
+
+/// A client's recorded consent (e.g. to share information with a third party). Optional for
+/// sharing (DEC-14): a share may reference one, but it never blocks a share.
+model Consent {
+  id                     String        @id @default(uuid(7)) @db.Uuid
+  tenantId               String        @map("tenant_id") @db.Uuid
+  clientId               String        @map("client_id") @db.Uuid
+  purpose                String
+  /// Who the client agreed information may go to, in the agency's words.
+  recipient              String?
+  method                 ConsentMethod
+  givenAt                DateTime      @map("given_at")
+  notes                  String?
+  withdrawnAt            DateTime?     @map("withdrawn_at")
+  recordedByMembershipId String        @map("recorded_by_membership_id") @db.Uuid
+  createdAt              DateTime      @default(now()) @map("created_at")
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  client     Client          @relation(fields: [tenantId, clientId], references: [tenantId, id], onDelete: Restrict)
+  recordedBy Membership      @relation(fields: [tenantId, recordedByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  shares     ResourceShare[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, clientId])
+  @@map("consents")
+}
+
+/// Gives one EXTERNAL member read access to one matter's basic details and selected documents
+/// (DEC-09). Checked on every request: revoking or expiry takes effect immediately.
+model ResourceShare {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  tenantId              String    @map("tenant_id") @db.Uuid
+  matterId              String    @map("matter_id") @db.Uuid
+  granteeMembershipId   String    @map("grantee_membership_id") @db.Uuid
+  consentId             String?   @map("consent_id") @db.Uuid
+  purpose               String?
+  expiresAt             DateTime? @map("expires_at")
+  revokedAt             DateTime? @map("revoked_at")
+  createdByMembershipId String    @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime  @default(now()) @map("created_at")
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  matter    Matter          @relation(fields: [tenantId, matterId], references: [tenantId, id], onDelete: Restrict)
+  grantee   Membership      @relation("ShareGrantee", fields: [tenantId, granteeMembershipId], references: [tenantId, id], onDelete: Restrict)
+  createdBy Membership      @relation("ShareCreator", fields: [tenantId, createdByMembershipId], references: [tenantId, id], onDelete: Restrict)
+  consent   Consent?        @relation(fields: [tenantId, consentId], references: [tenantId, id], onDelete: Restrict)
+  documents ShareDocument[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, granteeMembershipId])
+  @@index([tenantId, matterId])
+  @@map("resource_shares")
+}
+
+model ShareDocument {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  shareId    String   @map("share_id") @db.Uuid
+  documentId String   @map("document_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  share    ResourceShare @relation(fields: [tenantId, shareId], references: [tenantId, id], onDelete: Cascade)
+  document Document      @relation(fields: [tenantId, documentId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([shareId, documentId])
+  @@index([tenantId, documentId])
+  @@map("share_documents")
+}
+
+// ───────────────────────────── Platform (Stage 7) ─────────────────────────────
+
+/// Platform-wide roles (not tied to an agency). They see agency metadata only, never client data.
+enum PlatformRole {
+  SUPER_ADMIN
+  SUPPORT
+}
+
+/// Platform-level table (no tenant): who has a platform role. Granted only by a server command
+/// or by another super admin; public registration can never create one.
+model PlatformRoleAssignment {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  userId          String       @map("user_id") @db.Uuid
+  role            PlatformRole
+  grantedByUserId String?      @map("granted_by_user_id") @db.Uuid
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, role])
+  @@map("platform_role_assignments")
+}
+
+/// Usage limits for agencies. null = no limit. Assigned to agencies by platform admins.
+model Plan {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  key           String   @unique
+  name          String
+  maxStaffUsers Int?     @map("max_staff_users")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenants Tenant[]
+
+  @@map("plans")
+}
+
+// ───────────────────────────── Automation (Stage 8) ─────────────────────────────
+
+/// Task created automatically when a matter enters this stage (once per matter).
+model StageTaskTemplate {
+  id                 String       @id @default(uuid(7)) @db.Uuid
+  tenantId           String       @map("tenant_id") @db.Uuid
+  stageId            String       @map("stage_id") @db.Uuid
+  title              String
+  description        String?
+  priority           TaskPriority @default(MEDIUM)
+  /// Due this many days after the matter enters the stage. null = no due date.
+  dueInDays          Int?         @map("due_in_days")
+  /// Assign to the first person on the matter's team; otherwise unassigned.
+  assignToMatterLead Boolean      @default(true) @map("assign_to_matter_lead")
+  sortOrder          Int          @map("sort_order")
+  isActive           Boolean      @default(true) @map("is_active")
+  createdAt          DateTime     @default(now()) @map("created_at")
+
+  stage MatterStage @relation(fields: [tenantId, stageId], references: [tenantId, id], onDelete: Cascade)
+  tasks Task[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, stageId])
+  @@map("stage_task_templates")
+}
+
+/// One row per deadline and reminder offset already sent (each reminder goes out once).
+model DeadlineReminderLog {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  deadlineId String   @map("deadline_id") @db.Uuid
+  offsetDays Int      @map("offset_days")
+  sentAt     DateTime @default(now()) @map("sent_at")
+
+  deadline MatterDeadline @relation(fields: [tenantId, deadlineId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([deadlineId, offsetDays])
+  @@index([tenantId])
+  @@map("deadline_reminder_logs")
+}

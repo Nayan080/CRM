@@ -1,0 +1,52 @@
+# Local development services only. Never use these credentials outside your machine.
+# Start:  docker compose up -d      Stop: docker compose down      Reset data: docker compose down -v
+name: migration-crm
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm_local_password
+      POSTGRES_DB: crm
+    ports:
+      # Bound to localhost only, so the database is not exposed to your network.
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once on a NEW volume: creates crm_test and the crm_app runtime role.
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U crm -d crm']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Catches every email the API sends locally. Inbox UI: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.33.1
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:1025:1025' # SMTP
+      - '127.0.0.1:8025:8025' # Web inbox
+
+  # Local S3-compatible storage for documents (DEC-15, ADR-0007). Files are kept in a volume.
+  # The API creates the bucket on start-up in development. No browser ever talks to it directly.
+  s3:
+    image: andrewgaul/s3proxy:s3proxy-4.1.1
+    restart: unless-stopped
+    environment:
+      S3PROXY_AUTHORIZATION: aws-v2-or-v4
+      S3PROXY_IDENTITY: local-identity
+      S3PROXY_CREDENTIAL: local-credential
+      JCLOUDS_PROVIDER: filesystem
+      JCLOUDS_FILESYSTEM_BASEDIR: /data
+    ports:
+      - '127.0.0.1:9000:80'
+    volumes:
+      - s3-data:/data
+
+volumes:
+  postgres-data:
+  s3-data:

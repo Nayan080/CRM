@@ -1,0 +1,29 @@
+{
+  "name": "@crm/permissions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Permission codes and scopes shared by api + web (role templates added in Stage 2)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@crm/config": "workspace:*",
+    "@types/node": "22.20.5",
+    "eslint": "10.14.0",
+    "typescript": "6.0.3",
+    "vitest": "5.1.0"
+  }
+}

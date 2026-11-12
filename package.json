@@ -1,0 +1,31 @@
+{
+  "name": "migration-crm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Migration Business Management CRM — multi-tenant SaaS (monorepo)",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:integration": "turbo run test:integration --concurrency=1",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "pnpm --filter @crm/db run generate",
+    "db:validate": "pnpm --filter @crm/db run validate",
+    "db:migrate": "pnpm --filter @crm/db run migrate:dev",
+    "db:migrate:deploy": "pnpm --filter @crm/db run migrate:deploy",
+    "db:migrate:test": "pnpm --filter @crm/db run migrate:test",
+    "db:migrate:check": "pnpm --filter @crm/db run migrate:check"
+  },
+  "devDependencies": {
+    "prettier": "3.9.10",
+    "turbo": "2.11.10",
+    "typescript": "6.0.3"
+  }
+}
