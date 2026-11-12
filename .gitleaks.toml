@@ -1,0 +1,13 @@
+# Gitleaks config (auto-loaded by the CI "Secret scan" job from the repo root).
+# Keeps all default rules. Only allows the known LOCAL-DEV / TEST placeholder values below,
+# which are not real secrets. Never add a real secret here — remove it and rotate it instead.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Local-dev and test placeholders (not real secrets)"
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)apps/api/test/helpers/test-app\.ts$''',
+  '''\.tar$''',
+]

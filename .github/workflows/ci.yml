@@ -1,5 +1,4 @@
-# CI pipeline. Written in Stage 1; it runs once the code is pushed to a GitHub repository
-# (no repository exists yet by decision DEC-04).
+# CI pipeline: secret scan + lint, typecheck, tests and build on every push to main and every PR.
 name: CI
 
 on:
