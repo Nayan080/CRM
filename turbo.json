@@ -22,6 +22,12 @@
     "typecheck": {
       "dependsOn": ["^build"]
     },
+    "@crm/db#lint": {
+      "dependsOn": ["^build", "build"]
+    },
+    "@crm/db#typecheck": {
+      "dependsOn": ["^build", "build"]
+    },
     "test": {
       "dependsOn": ["^build"],
       "env": ["LOG_LEVEL"]
